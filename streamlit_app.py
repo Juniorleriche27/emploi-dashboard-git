@@ -33,15 +33,25 @@ st.divider()
 @st.cache_data(ttl=86400)
 def fetch_wdi_series(indicator: str, iso3: str, start: int, end: int) -> pd.DataFrame:
     import wbgapi as wb
-    df = wb.data.DataFrame(indicator, economy=iso3, time=range(start, end+1))
-    df = df.reset_index()  # colonnes: economy, time, <indicator_code>
-    # normalisation
-    val_col = [c for c in df.columns if c.upper() == indicator.upper()]
-    val_col = val_col[0] if val_col else indicator
-    df = df.rename(columns={"economy": "iso3", "time": "year", val_col: "value"})
+    # labels=False => colonnes simples (codes) plutôt que libellés longs
+    df = wb.data.DataFrame(indicator, economy=iso3, time=range(start, end + 1), labels=False)
+    df = df.reset_index()
+
+    # détecte de façon robuste les colonnes "économie / année / valeur"
+    cols_str = [str(c) for c in df.columns]
+    econ_col = "economy" if "economy" in cols_str else ("Economy" if "Economy" in cols_str else df.columns[0])
+    time_col = "time"    if "time"    in cols_str else ("Time"    if "Time"    in cols_str else df.columns[1])
+
+    value_cols = [c for c in df.columns if c not in [econ_col, time_col]]
+    if not value_cols:  # si l'API renvoie vide pour la période
+        return pd.DataFrame(columns=["year", "value"])
+
+    val_col = value_cols[0]
+    df = df.rename(columns={econ_col: "iso3", time_col: "year", val_col: "value"})
     df["year"] = df["year"].astype(int)
-    df = df.sort_values("year").loc[:, ["year", "value"]]
-    return df.dropna()
+    df = df.loc[:, ["year", "value"]].dropna().sort_values("year")
+    return df
+
 
 INDICATOR = "SL.UEM.1524.ZS"  # youth unemployment (% ages 15–24)
 data = fetch_wdi_series(INDICATOR, iso3, start, end)
