@@ -1,4 +1,7 @@
+# streamlit_app.py
 import io
+import os
+import json
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -12,34 +15,45 @@ try:
 except Exception:
     PLOTLY = False
 
-st.set_page_config(page_title="Kaggle EDA Pro — Analyse exploratoire", layout="wide")
+# (optionnel) Cohere
+try:
+    import cohere
+except Exception:
+    cohere = None
+
+# ---------------- UI de base ----------------
+st.set_page_config(page_title="Kaggle EDA Pro — Analyse + IA Cohere", layout="wide")
 st.title("Kaggle EDA Pro — Analyse exploratoire robuste")
 st.caption(
     "Charge un dataset Kaggle (CSV) puis explore : résumé, valeurs manquantes, distributions, "
-    "corrélations, séries temporelles, catégories. Export du CSV nettoyé."
+    "corrélations, séries temporelles, catégories. Export du CSV nettoyé. "
+    "Un onglet **Assistant IA (Cohere)** traduit du langage naturel → opérations pandas + rendu."
 )
 
-# ------------- Sidebar: chargement & options -------------
+# ---------------- Sidebar : chargement & options ----------------
 with st.sidebar:
     st.header("Chargement")
-    f = st.file_uploader("CSV Kaggle", type=["csv"])
+    f = st.file_uploader("CSV Kaggle", type=["csv"], help="200 MB max")
     sep = st.selectbox("Séparateur", [",", ";", "|", r"\t"], index=0)
     dec = st.selectbox("Décimal", [".", ","], index=0)
     enc = st.selectbox("Encodage", ["utf-8", "latin1", "utf-16"], index=0)
-    st.caption("Astuce: si erreur de décodage, change l’encodage et relance le chargement.")
+    st.caption("Astuce : si erreur de décodage, change l’encodage et relance le chargement.")
+
+def _decode_sep(sep_str: str) -> str:
+    # transforme r"\t" → "\t"
+    return sep_str.encode("utf-8").decode("unicode_escape")
 
 def load_csv(file, sep, dec, enc):
     if file is None:
         return None, "Aucun fichier"
-    # Première tentative
+    real_sep = _decode_sep(sep)
     try:
-        df = pd.read_csv(file, sep=sep.encode('utf-8').decode('unicode_escape'), decimal=dec, encoding=enc)
+        df = pd.read_csv(file, sep=real_sep, decimal=dec, encoding=enc)
         return df, "OK"
     except UnicodeDecodeError:
-        # Tentative fallback
         file.seek(0)
         try:
-            df = pd.read_csv(file, sep=sep.encode('utf-8').decode('unicode_escape'), decimal=dec, encoding="latin1")
+            df = pd.read_csv(file, sep=real_sep, decimal=dec, encoding="latin1")
             return df, "OK (fallback latin1)"
         except Exception as e:
             return None, f"Erreur décodage: {e}"
@@ -48,29 +62,26 @@ def load_csv(file, sep, dec, enc):
 
 df, status = load_csv(f, sep, dec, enc)
 
-# ------------- Fonctions utilitaires -------------
+# ---------------- Utilitaires ----------------
 def guess_datetime_columns(df: pd.DataFrame, thresh: float = 0.8):
-    """Renvoie la liste des colonnes qui semblent être des dates (≥ thresh parsables)."""
+    """Colonnes qui ressemblent à des dates (≥ thresh parsables)."""
     dt_cols = []
     for c in df.columns:
         s = df[c]
-        ok = 0
-        n = min(len(s), 300)  # échantillon
-        if n == 0: 
+        n = min(len(s), 300)
+        if n == 0:
             continue
         sample = s.dropna().astype(str).head(n)
         try:
             parsed = pd.to_datetime(sample, errors="coerce", infer_datetime_format=True)
-            ok = parsed.notna().mean()
+            if parsed.notna().mean() >= thresh:
+                dt_cols.append(c)
         except Exception:
-            ok = 0
-        if ok >= thresh:
-            dt_cols.append(c)
+            pass
     return dt_cols
 
 def basic_clean(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    # Normaliser noms colonnes
     out.columns = [str(c).strip().replace("\n", " ").replace("\r", " ") for c in out.columns]
     return out
 
@@ -79,130 +90,170 @@ def bytes_download(data: pd.DataFrame) -> bytes:
     data.to_csv(buf, index=False)
     return buf.getvalue().encode("utf-8")
 
-# ------------- Corps principal -------------
-if df is None:
+# ---------------- État : données prêtes ? ----------------
+no_data = df is None
+if no_data:
     st.info("➡️ Charge un CSV Kaggle dans la barre latérale pour commencer.")
-    st.stop()
+else:
+    df = basic_clean(df)
+    st.success(f"Fichier chargé ({status}) — shape: {df.shape[0]} lignes × {df.shape[1]} colonnes")
 
-df = basic_clean(df)
-st.success(f"Fichier chargé ({status}) — shape: {df.shape[0]} lignes × {df.shape[1]} colonnes")
+# ---------------- Layout des onglets ----------------
+tab_names = [
+    "Aperçu", "Qualité & manquants", "Numérique",
+    "Corrélations", "Séries temporelles", "Catégories",
+    "Exporter", "Assistant IA (Cohere)"
+]
+t0, t1, t2, t3, t4, t5, t6, tAI = st.tabs(tab_names)
 
-tabs = st.tabs(["Aperçu", "Qualité & manquants", "Numérique", "Corrélations", "Séries temporelles", "Catégories", "Exporter"])
-
-with tabs[0]:
-    st.subheader("Aperçu")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Lignes", f"{len(df):,}")
-    c2.metric("Colonnes", f"{df.shape[1]}")
-    c3.metric("Valeurs manquantes", f"{int(df.isna().sum().sum()):,}")
-    st.dataframe(df.head(50), use_container_width=True)
-
-with tabs[1]:
-    st.subheader("Qualité & manquants")
-    miss = df.isna().sum().sort_values(ascending=False)
-    miss_ratio = (miss / len(df) * 100).round(1)
-    qual = pd.DataFrame({"missing": miss, "missing_%": miss_ratio})
-    st.dataframe(qual, use_container_width=True)
-    if PLOTLY and len(qual) > 0:
-        fig = px.bar(qual.reset_index().rename(columns={"index":"col"}), x="col", y="missing_%", title="Taux de manquants (%)")
-        fig.update_layout(xaxis={"tickangle": -45})
-        st.plotly_chart(fig, use_container_width=True)
-
-with tabs[2]:
-    st.subheader("Exploration numérique")
-    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    if not num_cols:
-        st.warning("Aucune colonne numérique détectée.")
+# --- Aperçu ---
+with t0:
+    if no_data:
+        st.info("Charge un CSV pour voir l’aperçu.")
     else:
-        target = st.selectbox("Colonne numérique à explorer", num_cols)
-        desc = df[num_cols].describe().T
-        st.dataframe(desc, use_container_width=True)
-        if PLOTLY:
-            fig = px.histogram(df, x=target, nbins=50, title=f"Distribution de {target}")
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.line_chart(df[target])
+        st.subheader("Aperçu")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Lignes", f"{len(df):,}")
+        c2.metric("Colonnes", f"{df.shape[1]}")
+        c3.metric("Valeurs manquantes", f"{int(df.isna().sum().sum()):,}")
+        st.dataframe(df.head(50), use_container_width=True)
 
-with tabs[3]:
-    st.subheader("Corrélations (numériques)")
-    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    if len(num_cols) < 2:
-        st.warning("Besoin d’au moins 2 colonnes numériques.")
+# --- Qualité & manquants ---
+with t1:
+    if no_data:
+        st.info("Charge un CSV pour analyser les valeurs manquantes.")
     else:
-        corr = df[num_cols].corr(numeric_only=True)
-        st.dataframe(corr, use_container_width=True)
-        if PLOTLY:
-            fig = px.imshow(corr, text_auto=True, aspect="auto", title="Matrice de corrélation (Pearson)")
+        st.subheader("Qualité & manquants")
+        miss = df.isna().sum().sort_values(ascending=False)
+        miss_ratio = (miss / len(df) * 100).round(1)
+        qual = pd.DataFrame({"missing": miss, "missing_%": miss_ratio})
+        st.dataframe(qual, use_container_width=True)
+        if PLOTLY and len(qual) > 0:
+            fig = px.bar(
+                qual.reset_index().rename(columns={"index": "col"}),
+                x="col", y="missing_%", title="Taux de manquants (%)"
+            )
+            fig.update_layout(xaxis={"tickangle": -45})
             st.plotly_chart(fig, use_container_width=True)
 
-with tabs[4]:
-    st.subheader("Séries temporelles")
-    dt_cols = guess_datetime_columns(df)
-    if not dt_cols:
-        st.info("Aucune colonne date détectée automatiquement. Sélectionne manuellement si besoin.")
-        manual_dt = st.selectbox("Choisir une colonne date (optionnel)", [None] + df.columns.tolist())
-        if manual_dt:
-            dt_cols = [manual_dt]
-    if dt_cols:
-        dt_col = st.selectbox("Colonne date", dt_cols)
-        metric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        if not metric_cols:
-            st.warning("Aucune colonne numérique à tracer.")
+# --- Numérique ---
+with t2:
+    if no_data:
+        st.info("Charge un CSV pour explorer les colonnes numériques.")
+    else:
+        st.subheader("Exploration numérique")
+        num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        if not num_cols:
+            st.warning("Aucune colonne numérique détectée.")
         else:
-            ycol = st.selectbox("Série à tracer", metric_cols)
-            tmp = df[[dt_col, ycol]].dropna().copy()
-            tmp[dt_col] = pd.to_datetime(tmp[dt_col], errors="coerce")
-            tmp = tmp.dropna(subset=[dt_col]).sort_values(dt_col)
-            # agrégation mensuelle si haute fréquence
-            if tmp[dt_col].diff().dt.days.median() is not None and tmp[dt_col].diff().dt.days.median() < 25:
-                tmp = tmp.set_index(dt_col).resample("MS")[ycol].mean().reset_index()
+            target = st.selectbox("Colonne numérique à explorer", num_cols)
+            desc = df[num_cols].describe().T
+            st.dataframe(desc, use_container_width=True)
             if PLOTLY:
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=tmp[dt_col], y=tmp[ycol], mode="lines", name=ycol))
-                rm = tmp[ycol].rolling(3, min_periods=1).mean()
-                fig.add_trace(go.Scatter(x=tmp[dt_col], y=rm, mode="lines", name=f"{ycol} (MM3)", line=dict(dash="dash")))
-                fig.update_layout(title=f"Tendance {ycol}", xaxis_title="Date", yaxis_title=ycol)
+                fig = px.histogram(df, x=target, nbins=50, title=f"Distribution de {target}")
                 st.plotly_chart(fig, use_container_width=True)
             else:
-                st.line_chart(tmp.set_index(dt_col)[ycol])
-            # variations
-            tmp["MoM"] = tmp[ycol].diff()
-            tmp["YoY"] = tmp[ycol].diff(12)
-            st.write("Variations (Δ MoM / Δ YoY) — premières lignes :")
-            st.dataframe(tmp.tail(24), use_container_width=True)
+                st.line_chart(df[target])
+
+# --- Corrélations ---
+with t3:
+    if no_data:
+        st.info("Charge un CSV pour calculer la matrice de corrélation.")
     else:
-        st.warning("Aucune colonne date sélectionnée/détectée.")
+        st.subheader("Corrélations (numériques)")
+        num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        if len(num_cols) < 2:
+            st.warning("Besoin d’au moins 2 colonnes numériques.")
+        else:
+            corr = df[num_cols].corr(numeric_only=True)
+            st.dataframe(corr, use_container_width=True)
+            if PLOTLY:
+                fig = px.imshow(corr, text_auto=True, aspect="auto", title="Matrice de corrélation (Pearson)")
+                st.plotly_chart(fig, use_container_width=True)
 
-with tabs[5]:
-    st.subheader("Analyse catégorielle")
-    cat_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
-    if not cat_cols:
-        st.warning("Aucune colonne catégorielle détectée.")
+# --- Séries temporelles ---
+with t4:
+    if no_data:
+        st.info("Charge un CSV pour tracer les séries temporelles.")
     else:
-        cat = st.selectbox("Catégorie", cat_cols)
-        topn = st.slider("Top N", 5, 50, 15)
-        vc = df[cat].astype(str).value_counts().head(topn)
-        st.dataframe(vc.to_frame("compte"), use_container_width=True)
-        if PLOTLY:
-            st.plotly_chart(px.bar(vc[::-1], title=f"Top {topn} {cat}").update_layout(yaxis_title="compte"),
-                            use_container_width=True)
+        st.subheader("Séries temporelles")
+        dt_cols = guess_datetime_columns(df)
+        if not dt_cols:
+            st.info("Aucune colonne date détectée automatiquement. Sélectionne manuellement si besoin.")
+            manual_dt = st.selectbox("Choisir une colonne date (optionnel)", [None] + df.columns.tolist())
+            if manual_dt:
+                dt_cols = [manual_dt]
+        if dt_cols:
+            dt_col = st.selectbox("Colonne date", dt_cols)
+            metric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+            if not metric_cols:
+                st.warning("Aucune colonne numérique à tracer.")
+            else:
+                ycol = st.selectbox("Série à tracer", metric_cols)
+                tmp = df[[dt_col, ycol]].dropna().copy()
+                tmp[dt_col] = pd.to_datetime(tmp[dt_col], errors="coerce")
+                tmp = tmp.dropna(subset=[dt_col]).sort_values(dt_col)
 
-with tabs[6]:
-    st.subheader("Exporter")
-    st.download_button("Télécharger CSV nettoyé", data=bytes_download(df), file_name="dataset_nettoye.csv", mime="text/csv")
-    st.caption("Le CSV nettoyé garde uniquement les colonnes et le formatage normalisés.")
+                # agrégation mensuelle si haute fréquence
+                try:
+                    med = tmp[dt_col].diff().dt.days.median()
+                except Exception:
+                    med = None
+                if med is not None and med < 25:
+                    tmp = tmp.set_index(dt_col).resample("MS")[ycol].mean().reset_index()
 
+                if PLOTLY:
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(x=tmp[dt_col], y=tmp[ycol], mode="lines", name=ycol))
+                    rm = tmp[ycol].rolling(3, min_periods=1).mean()
+                    fig.add_trace(go.Scatter(x=tmp[dt_col], y=rm, mode="lines",
+                                             name=f"{ycol} (MM3)", line=dict(dash="dash")))
+                    fig.update_layout(title=f"Tendance {ycol}", xaxis_title="Date", yaxis_title=ycol)
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.line_chart(tmp.set_index(dt_col)[ycol])
 
-# ---------- Assistant IA (Cohere) : NL -> plan JSON -> Pandas ----------
-import os, json
-try:
-    import cohere
-except Exception:
-    cohere = None
+                tmp["MoM"] = tmp[ycol].diff()
+                tmp["YoY"] = tmp[ycol].diff(12)
+                st.write("Variations (Δ MoM / Δ YoY) — dernières lignes :")
+                st.dataframe(tmp.tail(24), use_container_width=True)
+        else:
+            st.warning("Aucune colonne date sélectionnée/détectée.")
 
-def _apply_plan(df, plan):
-    import numpy as np
-    out = df.copy()
+# --- Catégories ---
+with t5:
+    if no_data:
+        st.info("Charge un CSV pour analyser les colonnes catégorielles.")
+    else:
+        st.subheader("Analyse catégorielle")
+        cat_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
+        if not cat_cols:
+            st.warning("Aucune colonne catégorielle détectée.")
+        else:
+            cat = st.selectbox("Catégorie", cat_cols)
+            topn = st.slider("Top N", 5, 50, 15)
+            vc = df[cat].astype(str).value_counts().head(topn)
+            st.dataframe(vc.to_frame("compte"), use_container_width=True)
+            if PLOTLY:
+                st.plotly_chart(
+                    px.bar(vc[::-1], title=f"Top {topn} {cat}").update_layout(yaxis_title="compte"),
+                    use_container_width=True
+                )
+
+# --- Export ---
+with t6:
+    if no_data:
+        st.info("Charge un CSV pour exporter un fichier nettoyé.")
+    else:
+        st.subheader("Exporter")
+        st.download_button("Télécharger CSV nettoyé", data=bytes_download(df),
+                           file_name="dataset_nettoye.csv", mime="text/csv")
+        st.caption("Le CSV nettoyé garde uniquement les colonnes et le formatage normalisés.")
+
+# ---------------- Assistant IA (Cohere) ----------------
+def _apply_plan(df_in: pd.DataFrame, plan: dict) -> pd.DataFrame:
+    """Applique un 'plan JSON' (select/where/groupby/agg/sort/top_n) sur df_in."""
+    out = df_in.copy()
 
     # select
     if isinstance(plan.get("select"), list):
@@ -210,7 +261,7 @@ def _apply_plan(df, plan):
         if ok:
             out = out[ok]
 
-    # where (liste de conditions simples)
+    # where
     conds = plan.get("where", [])
     if isinstance(conds, list) and len(conds) > 0:
         mask = np.ones(len(out), dtype=bool)
@@ -236,7 +287,7 @@ def _apply_plan(df, plan):
     if plan.get("groupby") and plan.get("agg"):
         gb = [c for c in plan["groupby"] if c in out.columns]
         agg_ok = {"count","sum","mean","median","min","max","std","nunique"}
-        agg = {k:v for k,v in plan["agg"].items() if k in out.columns and v in agg_ok}
+        agg = {k:v for k,v in (plan.get("agg") or {}).items() if k in out.columns and v in agg_ok}
         if gb and agg:
             out = out.groupby(gb, dropna=False).agg(agg).reset_index()
 
@@ -253,90 +304,96 @@ def _apply_plan(df, plan):
 
     return out
 
-with st.tabs(["Assistant IA (Cohere)"])[0]:
+with tAI:
     st.subheader("Assistant IA (Cohere) — requête en langage naturel")
-    key = (st.secrets.get("COHERE_API_KEY") or os.getenv("COHERE_API_KEY"))
+
+    # clés
+    key = (st.secrets.get("COHERE_API_KEY") if hasattr(st, "secrets") else None) or os.getenv("COHERE_API_KEY")
     if cohere is None:
         st.error("Le paquet `cohere` n’est pas installé. Ajoute `cohere>=5.3.0` dans requirements.txt.")
         st.stop()
     if not key:
-        st.warning("Ajoute ta clé dans Settings → Secrets : COHERE_API_KEY.")
-        st.stop()
-    if 'df' not in globals() and 'df' not in locals():
-        st.info("Charge d’abord un CSV dans l’onglet EDA, puis reviens ici.")
+        st.warning("Ajoute ta clé Cohere : **Manage app → Settings → Secrets** puis `COHERE_API_KEY = \"sk_...\"`.")
         st.stop()
 
+    model = st.selectbox("Modèle Cohere", ["command-r", "command-r-plus"], index=0)
     user_q = st.text_area(
         "Que veux-tu voir/obtenir ?",
-        placeholder="Ex.: « moyenne du prix par catégorie pour 2023 », "
-                    "« top 10 des régions par ventes », « évolution mensuelle du CA »..."
+        placeholder="Ex. « moyenne du prix par catégorie pour 2023 », « top 10 des régions par ventes », « évolution mensuelle du CA »…"
     )
-    model = st.selectbox("Modèle Cohere", ["command-r", "command-r-plus"], index=0)
 
-    schema = [{"name": c, "dtype": str(df[c].dtype)} for c in df.columns]
-    sample = df.head(10).to_dict(orient="records")
+    if no_data:
+        st.info("Charge d’abord un CSV dans les autres onglets, puis formule ta demande ici.")
+    else:
+        # Schéma & échantillon fournis au modèle
+        schema = [{"name": c, "dtype": str(df[c].dtype)} for c in df.columns]
+        sample = df.head(10).to_dict(orient="records")
 
-    if st.button("Générer le résultat"):
-        client = cohere.Client(key)
+        if st.button("Générer le résultat"):
+            client = cohere.Client(key)
 
-        system = (
-            "Tu traduis la demande utilisateur en un **plan JSON** pour manipuler un DataFrame pandas nommé df. "
-            "Réponds **UNIQUEMENT** avec un JSON valide suivant ce schéma strict :\n"
-            "{\n"
-            '  "select": [string]? ,\n'
-            '  "where": [{"col": str, "op": "==|!=|>|<|>=|<=", "value": any, "join": "and|or"}]?,\n'
-            '  "groupby": [string]? ,\n'
-            '  "agg": {string: "count|sum|mean|median|min|max|std|nunique"}? ,\n'
-            '  "sort_by": [string]? ,\n'
-            '  "ascending": bool?,\n'
-            '  "top_n": int? ,\n'
-            '  "chart": {"type":"bar|line|hist","x":str,"y":str}?\n'
-            "}\n"
-            "Règles : n’invente pas de colonnes ; reste dans ce schéma ; pas d’explications en texte."
-        )
+            system = (
+                "Tu traduis la demande utilisateur en un **plan JSON** pour manipuler un DataFrame pandas nommé df. "
+                "Réponds **UNIQUEMENT** avec un JSON valide suivant ce schéma strict :\n"
+                "{\n"
+                '  "select": [string]? ,\n'
+                '  "where": [{"col": str, "op": "==|!=|>|<|>=|<=", "value": any, "join": "and|or"}]?,\n'
+                '  "groupby": [string]? ,\n'
+                '  "agg": {string: "count|sum|mean|median|min|max|std|nunique"}? ,\n'
+                '  "sort_by": [string]? ,\n'
+                '  "ascending": bool?,\n'
+                '  "top_n": int? ,\n'
+                '  "chart": {"type":"bar|line|hist","x":str,"y":str}?\n'
+                "}\n"
+                "Règles : n’invente pas de colonnes ; reste dans ce schéma ; pas d’explications en texte."
+            )
 
-        user = (
-            f"Colonnes & dtypes: {schema}\n"
-            f"Exemples (10 lignes): {sample}\n"
-            f"Demande: {user_q}\n"
-            "Réponds uniquement le JSON."
-        )
+            user = (
+                f"Colonnes & dtypes: {schema}\n"
+                f"Exemples (10 lignes): {sample}\n"
+                f"Demande: {user_q}\n"
+                "Réponds uniquement le JSON."
+            )
 
-        resp = client.chat(model=model, messages=[
-            {"role": "system", "content": system},
-            {"role": "user",   "content": user},
-        ])
+            try:
+                resp = client.chat(model=model, messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": user},
+                ])
+            except Exception as e:
+                st.error(f"Appel Cohere échoué : {e}")
+                st.stop()
 
-        # Compat v5 : .text ou .message.content[0].text
-        if hasattr(resp, "text") and resp.text:
-            raw = resp.text
-        else:
-            raw = resp.message.content[0].text
+            # Compat v5
+            raw = getattr(resp, "text", None) or (resp.message.content[0].text if getattr(resp, "message", None) else "")
+            if not raw:
+                st.error("Réponse vide du modèle.")
+                st.stop()
 
-        try:
-            plan = json.loads(raw)
-        except Exception:
-            st.error("Réponse non-JSON du modèle. Voici le retour brut :")
-            st.code(raw)
-            st.stop()
+            try:
+                plan = json.loads(raw)
+            except Exception:
+                st.error("Réponse non-JSON du modèle. Voici le retour brut :")
+                st.code(raw)
+                st.stop()
 
-        st.write("**Plan généré**")
-        st.code(plan, language="json")
+            st.write("**Plan généré**")
+            st.json(plan)
 
-        try:
-            out = _apply_plan(df, plan)
-        except Exception as e:
-            st.error(f"Erreur lors de l’application du plan: {e}")
-            st.stop()
+            try:
+                out = _apply_plan(df, plan)
+            except Exception as e:
+                st.error(f"Erreur lors de l’application du plan: {e}")
+                st.stop()
 
-        st.subheader("Résultat")
-        st.dataframe(out, use_container_width=True)
+            st.subheader("Résultat")
+            st.dataframe(out, use_container_width=True)
 
-        ch = plan.get("chart") or {}
-        if {"type","x","y"} <= set(ch) and ch["x"] in out.columns and ch["y"] in out.columns:
-            if ch["type"] == "line":
-                st.line_chart(out.set_index(ch["x"])[ch["y"]])
-            elif ch["type"] == "hist":
-                st.bar_chart(out[ch["y"]].value_counts())
-            else:  # bar
-                st.bar_chart(out.set_index(ch["x"])[ch["y"]])
+            ch = plan.get("chart") or {}
+            if {"type","x","y"} <= set(ch) and ch["x"] in out.columns and ch["y"] in out.columns:
+                if ch["type"] == "line":
+                    st.line_chart(out.set_index(ch["x"])[ch["y"]])
+                elif ch["type"] == "hist":
+                    st.bar_chart(out[ch["y"]].value_counts())
+                else:  # bar
+                    st.bar_chart(out.set_index(ch["x"])[ch["y"]])
