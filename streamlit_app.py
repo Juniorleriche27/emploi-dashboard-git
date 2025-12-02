@@ -1,27 +1,93 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 
-st.set_page_config(page_title="Dashboard Emploi-Jeunesse", layout="wide")
+# --- dépendance en ligne : wbgapi (World Bank) ---
+# Ajoute "wbgapi" dans requirements.txt (voir étape sous le code)
 
-st.title("Dashboard Emploi-Jeunesse (prototype)")
-st.caption("Données factices pour la démo – on branchera une source publique ensuite.")
+st.set_page_config(page_title="Emploi des jeunes — Analyse officielle (WDI)", layout="wide")
+st.title("Emploi des jeunes — Analyse officielle (World Bank / ILO modelled)")
+st.caption(
+    "Source: World Development Indicators (WDI), indicateur SL.UEM.1524.ZS (taux de chômage des 15–24 ans). "
+    "Les estimations sont modélisées (ILO). Utilisation pédagogique."
+)
 
-# Mini dataset (démo)
-data = pd.DataFrame({
-    "mois": ["2024-06","2024-07","2024-08","2024-09","2024-10","2024-11"],
-    "chomage": [20.1, 19.8, 19.6, 19.4, 19.3, 19.2],
-    "activite": [40.2, 40.5, 40.9, 41.2, 41.4, 41.7],
-    "emploi": [32.1, 32.5, 32.7, 33.2, 33.4, 33.6],
-})
+# -------- Paramètres utilisateur --------
+COUNTRIES = {
+    "Togo (TGO)": "TGO",
+    "Côte d’Ivoire (CIV)": "CIV",
+    "Bénin (BEN)": "BEN",
+    "Ghana (GHA)": "GHA",
+    "Sénégal (SEN)": "SEN",
+    "France (FRA)": "FRA",
+    "Maroc (MAR)": "MAR",
+}
+colA, colB = st.columns([1,1])
+iso3 = colA.selectbox("Pays", list(COUNTRIES.keys()), index=0)
+iso3 = COUNTRIES[iso3]
+start, end = colB.slider("Période", 1991, 2024, (2000, 2024))
 
-last, prev = data.iloc[-1], data.iloc[-2]
-c1, c2, c3 = st.columns(3)
-c1.metric("Taux de chômage jeunes", f"{last['chomage']:.1f} %", f"{last['chomage']-prev['chomage']:+.1f} pt")
-c2.metric("Taux d’activité jeunes", f"{last['activite']:.1f} %", f"{last['activite']-prev['activite']:+.1f} pt")
-c3.metric("Taux d’emploi jeunes",  f"{last['emploi']:.1f} %",  f"{last['emploi']-prev['emploi']:+.1f} pt")
+st.divider()
 
-st.subheader("Tendances récentes")
-st.line_chart(data.set_index("mois")[["chomage","emploi","activite"]])
+# -------- Chargement (API WDI) --------
+@st.cache_data(ttl=86400)
+def fetch_wdi_series(indicator: str, iso3: str, start: int, end: int) -> pd.DataFrame:
+    import wbgapi as wb
+    df = wb.data.DataFrame(indicator, economy=iso3, time=range(start, end+1))
+    df = df.reset_index()  # colonnes: economy, time, <indicator_code>
+    # normalisation
+    val_col = [c for c in df.columns if c.upper() == indicator.upper()]
+    val_col = val_col[0] if val_col else indicator
+    df = df.rename(columns={"economy": "iso3", "time": "year", val_col: "value"})
+    df["year"] = df["year"].astype(int)
+    df = df.sort_values("year").loc[:, ["year", "value"]]
+    return df.dropna()
 
-with st.expander("Voir les données"):
+INDICATOR = "SL.UEM.1524.ZS"  # youth unemployment (% ages 15–24)
+data = fetch_wdi_series(INDICATOR, iso3, start, end)
+
+if data.empty or len(data) < 2:
+    st.warning("Pas assez de points sur cette période. Élargis la période.")
+    st.stop()
+
+# -------- Indicateurs analytiques --------
+last = data.iloc[-1]
+prev = data.iloc[-2]
+delta_yoy = last["value"] - prev["value"]          # variation annuelle (points)
+cagr_years = max(1, last["year"] - data.iloc[0]["year"])
+cagr = ( (last["value"] + 1e-9) / (data.iloc[0]["value"] + 1e-9) ) ** (1 / cagr_years) - 1  # approx si valeurs >0
+# pente (tendance linéaire)
+x = data["year"].values
+y = data["value"].values
+slope = np.polyfit(x, y, 1)[0]  # points de % par an
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Dernière valeur", f"{last['value']:.1f} %", f"{delta_yoy:+.1f} pt vs {int(prev['year'])}")
+c2.metric("Tendance (pente/an)", f"{slope:+.2f} pt/an")
+c3.metric("CAGR sur période", f"{100*cagr:+.2f} %/an")
+c4.metric("Période couverte", f"{int(data['year'].min())}-{int(data['year'].max())}")
+
+# lissage 3 ans + variation YoY
+data["roll3"] = data["value"].rolling(3, min_periods=1).mean()
+data["yoy"] = data["value"].diff(1)
+
+st.subheader("Niveau & tendance (avec moyenne mobile 3 ans)")
+st.line_chart(data.set_index("year")[["value", "roll3"]])
+
+st.subheader("Variation annuelle (YoY, en points de pourcentage)")
+st.bar_chart(data.set_index("year")[["yoy"]])
+
+with st.expander("Données (téléchargement)"):
     st.dataframe(data, use_container_width=True)
+    st.download_button(
+        "Télécharger CSV (nettoyé)",
+        data.to_csv(index=False).encode("utf-8"),
+        file_name=f"youth_unemployment_{iso3}_{start}_{end}.csv",
+        mime="text/csv",
+    )
+
+st.info(
+    "Notes méthode — Source: WDI (World Bank), indicateur SL.UEM.1524.ZS.\n"
+    "Niveau de preuve: **élevé** (source officielle), mais **incertitudes**: "
+    "estimations modélisées par l’OIT, ruptures possibles dans les séries, comparabilité internationale imparfaite."
+)
