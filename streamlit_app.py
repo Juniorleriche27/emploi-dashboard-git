@@ -31,36 +31,43 @@ st.caption(
 )
 
 # ---------------- Sidebar : chargement & options ----------------
+
+# ----------- Sidebar: upload + options (REMPLACE ton bloc actuel) -----------
 with st.sidebar:
     st.header("Chargement")
-    f = st.file_uploader("CSV Kaggle", type=["csv"], help="200 MB max")
+    f = st.file_uploader("CSV Kaggle", type=["csv"], key="csv_uploader")
     sep = st.selectbox("Séparateur", [",", ";", "|", r"\t"], index=0)
     dec = st.selectbox("Décimal", [".", ","], index=0)
     enc = st.selectbox("Encodage", ["utf-8", "latin1", "utf-16"], index=0)
     st.caption("Astuce : si erreur de décodage, change l’encodage et relance le chargement.")
+    if f is not None:
+        st.success(f"Fichier reçu : {f.name} • {f.size/1_048_576:.2f} MB")
 
-def _decode_sep(sep_str: str) -> str:
-    # transforme r"\t" → "\t"
-    return sep_str.encode("utf-8").decode("unicode_escape")
-
-def load_csv(file, sep, dec, enc):
-    if file is None:
+def load_csv(uploaded_file, sep, dec, enc):
+    if uploaded_file is None:
         return None, "Aucun fichier"
-    real_sep = _decode_sep(sep)
+    real_sep = sep.encode("utf-8").decode("unicode_escape")  # r"\t" -> "\t"
+    data = uploaded_file.getvalue()  # lit en mémoire, évite les soucis de pointeur
     try:
-        df = pd.read_csv(file, sep=real_sep, decimal=dec, encoding=enc)
+        df = pd.read_csv(io.BytesIO(data), sep=real_sep, decimal=dec, encoding=enc)
         return df, "OK"
     except UnicodeDecodeError:
-        file.seek(0)
         try:
-            df = pd.read_csv(file, sep=real_sep, decimal=dec, encoding="latin1")
+            df = pd.read_csv(io.BytesIO(data), sep=real_sep, decimal=dec, encoding="latin1")
             return df, "OK (fallback latin1)"
         except Exception as e:
             return None, f"Erreur décodage: {e}"
     except Exception as e:
         return None, f"Erreur lecture: {e}"
 
-df, status = load_csv(f, sep, dec, enc)
+# ----------- Lecture robuste + messages explicites (REMPLACE ton init df/status) -----------
+with st.spinner("Lecture du CSV…") if f else st.empty():
+    df, status = load_csv(f, sep, dec, enc)
+
+if f and df is None:
+    st.error(f"Échec du chargement : {status}. Essaie un autre **Séparateur** (souvent ';' pour les CSV européens) "
+             f"et/ou **Encodage** (essaie 'latin1').")
+
 
 # ---------------- Utilitaires ----------------
 def guess_datetime_columns(df: pd.DataFrame, thresh: float = 0.8):
