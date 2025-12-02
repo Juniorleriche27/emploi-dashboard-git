@@ -191,3 +191,152 @@ with tabs[6]:
     st.subheader("Exporter")
     st.download_button("Télécharger CSV nettoyé", data=bytes_download(df), file_name="dataset_nettoye.csv", mime="text/csv")
     st.caption("Le CSV nettoyé garde uniquement les colonnes et le formatage normalisés.")
+
+
+# ---------- Assistant IA (Cohere) : NL -> plan JSON -> Pandas ----------
+import os, json
+try:
+    import cohere
+except Exception:
+    cohere = None
+
+def _apply_plan(df, plan):
+    import numpy as np
+    out = df.copy()
+
+    # select
+    if isinstance(plan.get("select"), list):
+        ok = [c for c in plan["select"] if c in out.columns]
+        if ok:
+            out = out[ok]
+
+    # where (liste de conditions simples)
+    conds = plan.get("where", [])
+    if isinstance(conds, list) and len(conds) > 0:
+        mask = np.ones(len(out), dtype=bool)
+        for cond in conds:
+            col = cond.get("col"); op = cond.get("op"); val = cond.get("value")
+            join = (cond.get("join") or "and").lower()
+            if col not in out.columns or op not in ["==","!=",">","<",">=","<="]:
+                continue
+            s = out[col]
+            try:
+                if op == "==": cur = (s == val)
+                elif op == "!=": cur = (s != val)
+                elif op ==  ">": cur = (s  > val)
+                elif op ==  "<": cur = (s  < val)
+                elif op == ">=": cur = (s >= val)
+                else:            cur = (s <= val)
+            except Exception:
+                continue
+            mask = (mask & cur) if join == "and" else (mask | cur)
+        out = out[mask]
+
+    # groupby / agg
+    if plan.get("groupby") and plan.get("agg"):
+        gb = [c for c in plan["groupby"] if c in out.columns]
+        agg_ok = {"count","sum","mean","median","min","max","std","nunique"}
+        agg = {k:v for k,v in plan["agg"].items() if k in out.columns and v in agg_ok}
+        if gb and agg:
+            out = out.groupby(gb, dropna=False).agg(agg).reset_index()
+
+    # sort
+    if plan.get("sort_by"):
+        by = [c for c in plan["sort_by"] if c in out.columns]
+        if by:
+            out = out.sort_values(by=by, ascending=bool(plan.get("ascending", False)))
+
+    # top_n
+    if isinstance(plan.get("top_n"), int):
+        n = max(1, min(1000, int(plan["top_n"])))
+        out = out.head(n)
+
+    return out
+
+with st.tabs(["Assistant IA (Cohere)"])[0]:
+    st.subheader("Assistant IA (Cohere) — requête en langage naturel")
+    key = (st.secrets.get("COHERE_API_KEY") or os.getenv("COHERE_API_KEY"))
+    if cohere is None:
+        st.error("Le paquet `cohere` n’est pas installé. Ajoute `cohere>=5.3.0` dans requirements.txt.")
+        st.stop()
+    if not key:
+        st.warning("Ajoute ta clé dans Settings → Secrets : COHERE_API_KEY.")
+        st.stop()
+    if 'df' not in globals() and 'df' not in locals():
+        st.info("Charge d’abord un CSV dans l’onglet EDA, puis reviens ici.")
+        st.stop()
+
+    user_q = st.text_area(
+        "Que veux-tu voir/obtenir ?",
+        placeholder="Ex.: « moyenne du prix par catégorie pour 2023 », "
+                    "« top 10 des régions par ventes », « évolution mensuelle du CA »..."
+    )
+    model = st.selectbox("Modèle Cohere", ["command-r", "command-r-plus"], index=0)
+
+    schema = [{"name": c, "dtype": str(df[c].dtype)} for c in df.columns]
+    sample = df.head(10).to_dict(orient="records")
+
+    if st.button("Générer le résultat"):
+        client = cohere.Client(key)
+
+        system = (
+            "Tu traduis la demande utilisateur en un **plan JSON** pour manipuler un DataFrame pandas nommé df. "
+            "Réponds **UNIQUEMENT** avec un JSON valide suivant ce schéma strict :\n"
+            "{\n"
+            '  "select": [string]? ,\n'
+            '  "where": [{"col": str, "op": "==|!=|>|<|>=|<=", "value": any, "join": "and|or"}]?,\n'
+            '  "groupby": [string]? ,\n'
+            '  "agg": {string: "count|sum|mean|median|min|max|std|nunique"}? ,\n'
+            '  "sort_by": [string]? ,\n'
+            '  "ascending": bool?,\n'
+            '  "top_n": int? ,\n'
+            '  "chart": {"type":"bar|line|hist","x":str,"y":str}?\n'
+            "}\n"
+            "Règles : n’invente pas de colonnes ; reste dans ce schéma ; pas d’explications en texte."
+        )
+
+        user = (
+            f"Colonnes & dtypes: {schema}\n"
+            f"Exemples (10 lignes): {sample}\n"
+            f"Demande: {user_q}\n"
+            "Réponds uniquement le JSON."
+        )
+
+        resp = client.chat(model=model, messages=[
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
+        ])
+
+        # Compat v5 : .text ou .message.content[0].text
+        if hasattr(resp, "text") and resp.text:
+            raw = resp.text
+        else:
+            raw = resp.message.content[0].text
+
+        try:
+            plan = json.loads(raw)
+        except Exception:
+            st.error("Réponse non-JSON du modèle. Voici le retour brut :")
+            st.code(raw)
+            st.stop()
+
+        st.write("**Plan généré**")
+        st.code(plan, language="json")
+
+        try:
+            out = _apply_plan(df, plan)
+        except Exception as e:
+            st.error(f"Erreur lors de l’application du plan: {e}")
+            st.stop()
+
+        st.subheader("Résultat")
+        st.dataframe(out, use_container_width=True)
+
+        ch = plan.get("chart") or {}
+        if {"type","x","y"} <= set(ch) and ch["x"] in out.columns and ch["y"] in out.columns:
+            if ch["type"] == "line":
+                st.line_chart(out.set_index(ch["x"])[ch["y"]])
+            elif ch["type"] == "hist":
+                st.bar_chart(out[ch["y"]].value_counts())
+            else:  # bar
+                st.bar_chart(out.set_index(ch["x"])[ch["y"]])
